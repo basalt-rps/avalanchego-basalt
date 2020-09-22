@@ -47,6 +47,11 @@ type Config struct {
 	StakerMSGPortion        float64
 	StakerCPUPortion        float64
 
+	// Basalt peer sampling configuration
+	EnableBasalt          bool
+	BasaltNonHierarchical bool
+	BasaltViewSize        int
+
 	// Network configuration
 	NetworkConfig timer.AdaptiveTimeoutConfig
 

@@ -141,6 +141,11 @@ func init() {
 	fs.StringVar(&Config.StakingCertFile, "staking-tls-cert-file", defaultStakingCertPath, "TLS certificate for staking")
 	fs.Uint64Var(&Config.DisabledStakingWeight, "staking-disabled-weight", 1, "Weight to provide to each peer when staking is disabled")
 
+	// Basalt:
+	fs.BoolVar(&Config.EnableBasalt, "enable-basalt", true, "Enable Basalt peer sampling when staking is disabled")
+	fs.BoolVar(&Config.BasaltNonHierarchical, "basalt-non-hierarchical", false, "Use non-hierarchical (flat) sampling function for Basalt")
+	fs.IntVar(&Config.BasaltViewSize, "basalt-view-size", 30, "Basalt view size")
+
 	// Throttling:
 	fs.UintVar(&Config.MaxNonStakerPendingMsgs, "max-non-staker-pending-msgs", 3, "Maximum number of messages a non-staker is allowed to have pending.")
 	fs.Float64Var(&Config.StakerMSGPortion, "staker-msg-reserved", 0.2, "Reserve a portion of the chain message queue's space for stakers.")

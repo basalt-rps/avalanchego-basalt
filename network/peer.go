@@ -58,6 +58,9 @@ type peer struct {
 	// the connection object that is used to read/write messages from
 	conn net.Conn
 
+	// is this an incoming or an outgoing connection ?
+	isIncoming bool
+
 	// version that the peer reported during the handshake
 	versionStr string
 
@@ -758,4 +761,25 @@ func (p *peer) discardMyIP() {
 		p.net.stateLock.Unlock()
 	}
 	p.Close()
+}
+
+// Get peer's IP
+func (p *peer) IP() utils.IPDesc {
+	ipdesc := p.ip
+	if ipdesc.IP == nil {
+		remoteaddr := p.conn.RemoteAddr().String()
+		host, _, _ := net.SplitHostPort(remoteaddr)
+		ipdesc.IP = net.ParseIP(host)
+	}
+	return ipdesc
+}
+
+// Get peer's ID
+func (p *peer) ID() ids.ShortID {
+	return p.id
+}
+
+// Is it an incoming connection?
+func (p *peer) IsIncoming() bool {
+	return p.isIncoming
 }

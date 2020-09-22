@@ -31,6 +31,7 @@ import (
 	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/avalanchego/ipcs"
 	"github.com/ava-labs/avalanchego/network"
+	"github.com/ava-labs/avalanchego/network/peer_sampling"
 	"github.com/ava-labs/avalanchego/snow/networking/router"
 	"github.com/ava-labs/avalanchego/snow/networking/timeout"
 	"github.com/ava-labs/avalanchego/snow/triggers"
@@ -166,6 +167,7 @@ func (n *Node) initNetworking() error {
 	}
 
 	consensusRouter := n.Config.ConsensusRouter
+
 	if !n.Config.EnableStaking {
 		if err := primaryNetworkValidators.AddWeight(n.ID, n.Config.DisabledStakingWeight); err != nil {
 			return err
@@ -197,6 +199,37 @@ func (n *Node) initNetworking() error {
 		}
 	}
 
+	// Use Basalt peer sampling if necessary
+	var peer_sampler peer_sampling.Sampler
+	if n.Config.EnableStaking || !n.Config.EnableBasalt {
+		peer_sampler = &peer_sampling.DefaultPeerSampler{}
+	} else {
+		cost_function := peer_sampling.BasaltHierarchicalCost
+		if n.Config.BasaltNonHierarchical {
+			cost_function = peer_sampling.BasaltUniformCost
+		}
+
+		bootstrap_peers := make([]ids.ShortID, 0, len(n.Config.BootstrapPeers))
+		for _, p := range n.Config.BootstrapPeers {
+			fmt.Printf("BOOTSTRAP PEER %s %s\n", p.ID, p.IP)
+			bootstrap_peers = append(bootstrap_peers, p.ID)
+		}
+
+		basalt := peer_sampling.BasaltPeerSampler{
+			ViewSize:          n.Config.BasaltViewSize,
+			SeedRenewInterval: 10 * time.Second,
+			SeedRenewCount:    10,
+			CostFunction:      cost_function,
+			ValidatorsHandler: consensusRouter,
+			BootstrapPeers:    bootstrap_peers,
+		}
+		basalt.Initialize(n.Log)
+		peer_sampler = &basalt
+		// Replace network.go -> consensusRouter for connected/disconnected
+		// by network.go -> peerSampler -> consensusRouter
+		consensusRouter = &ignoreConnRouter{consensusRouter}
+	}
+
 	n.Net = network.NewDefaultNetwork(
 		n.Config.ConsensusParams.Metrics,
 		n.Log,
@@ -212,6 +245,7 @@ func (n *Node) initNetworking() error {
 		primaryNetworkValidators,
 		n.beacons,
 		consensusRouter,
+		peer_sampler,
 	)
 
 	n.nodeCloser = utils.HandleSignals(func(os.Signal) {
@@ -239,6 +273,13 @@ func (i *insecureValidatorManager) Disconnected(vdrID ids.ShortID) {
 	_ = i.vdrs.RemoveWeight(vdrID, i.weight)
 	i.Router.Disconnected(vdrID)
 }
+
+type ignoreConnRouter struct {
+	router.Router
+}
+
+func (i *ignoreConnRouter) Connected(vdrID ids.ShortID)    {}
+func (i *ignoreConnRouter) Disconnected(vdrID ids.ShortID) {}
 
 type beaconManager struct {
 	router.Router

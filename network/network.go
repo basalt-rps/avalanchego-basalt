@@ -16,6 +16,7 @@ import (
 
 	"github.com/ava-labs/avalanchego/api/health"
 	"github.com/ava-labs/avalanchego/ids"
+	"github.com/ava-labs/avalanchego/network/peer_sampling"
 	"github.com/ava-labs/avalanchego/snow/networking/router"
 	"github.com/ava-labs/avalanchego/snow/networking/sender"
 	"github.com/ava-labs/avalanchego/snow/triggers"
@@ -38,8 +39,6 @@ const (
 	defaultMaxNetworkPendingSendBytes                = 1 << 29 // 512MB
 	defaultNetworkPendingSendBytesToRateLimit        = defaultMaxNetworkPendingSendBytes / 4
 	defaultMaxClockDifference                        = time.Minute
-	defaultPeerListGossipSpacing                     = time.Minute
-	defaultPeerListGossipSize                        = 100
 	defaultPeerListStakerGossipFraction              = 2
 	defaultGetVersionTimeout                         = 2 * time.Second
 	defaultAllowPrivateIPs                           = true
@@ -119,8 +118,6 @@ type network struct {
 	maxNetworkPendingSendBytes         int
 	networkPendingSendBytesToRateLimit int
 	maxClockDifference                 time.Duration
-	peerListGossipSpacing              time.Duration
-	peerListGossipSize                 int
 	peerListStakerGossipFraction       int
 	getVersionTimeout                  time.Duration
 	allowPrivateIPs                    bool
@@ -141,6 +138,8 @@ type network struct {
 	// TODO: bound the size of [myIPs] to avoid DoS. LRU caching would be ideal
 	myIPs map[string]struct{} // set of IPs that resulted in my ID.
 	peers map[[20]byte]*peer
+
+	peerSampler peer_sampling.Sampler
 }
 
 // NewDefaultNetwork returns a new Network implementation with the provided
@@ -160,6 +159,7 @@ func NewDefaultNetwork(
 	vdrs validators.Set,
 	beacons validators.Set,
 	router router.Router,
+	peerSampler peer_sampling.Sampler,
 ) Network {
 	return NewNetwork(
 		registerer,
@@ -183,14 +183,13 @@ func NewDefaultNetwork(
 		defaultMaxNetworkPendingSendBytes,
 		defaultNetworkPendingSendBytesToRateLimit,
 		defaultMaxClockDifference,
-		defaultPeerListGossipSpacing,
-		defaultPeerListGossipSize,
 		defaultPeerListStakerGossipFraction,
 		defaultGetVersionTimeout,
 		defaultAllowPrivateIPs,
 		defaultGossipSize,
 		defaultPingPongTimeout,
 		defaultPingFrequency,
+		peerSampler,
 	)
 }
 
@@ -217,14 +216,13 @@ func NewNetwork(
 	maxNetworkPendingSendBytes int,
 	networkPendingSendBytesToRateLimit int,
 	maxClockDifference time.Duration,
-	peerListGossipSpacing time.Duration,
-	peerListGossipSize int,
 	peerListStakerGossipFraction int,
 	getVersionTimeout time.Duration,
 	allowPrivateIPs bool,
 	gossipSize int,
 	pingPongTimeout time.Duration,
 	pingFrequency time.Duration,
+	peerSampler peer_sampling.Sampler,
 ) Network {
 	// #nosec G404
 	netw := &network{
@@ -252,8 +250,6 @@ func NewNetwork(
 		maxNetworkPendingSendBytes:         maxNetworkPendingSendBytes,
 		networkPendingSendBytesToRateLimit: networkPendingSendBytesToRateLimit,
 		maxClockDifference:                 maxClockDifference,
-		peerListGossipSpacing:              peerListGossipSpacing,
-		peerListGossipSize:                 peerListGossipSize,
 		peerListStakerGossipFraction:       peerListStakerGossipFraction,
 		getVersionTimeout:                  getVersionTimeout,
 		allowPrivateIPs:                    allowPrivateIPs,
@@ -265,6 +261,8 @@ func NewNetwork(
 		retryDelay:                         make(map[string]time.Duration),
 		myIPs:                              map[string]struct{}{ip.String(): {}},
 		peers:                              make(map[[20]byte]*peer),
+
+		peerSampler: peerSampler,
 	}
 	if err := netw.initialize(registerer); err != nil {
 		log.Warn("initializing network metrics failed with: %s", err)
@@ -622,8 +620,9 @@ func (n *network) Dispatch() error {
 			return err
 		}
 		go n.upgrade(&peer{
-			net:  n,
-			conn: conn,
+			net:        n,
+			conn:       conn,
+			isIncoming: true,
 		}, n.serverUpgrader)
 	}
 }
@@ -662,6 +661,8 @@ func (n *network) Close() error {
 		return nil
 	}
 	n.closed = true
+
+	n.peerSampler.Shutdown()
 
 	peersToClose := []*peer(nil)
 	for _, peer := range n.peers {
@@ -737,14 +738,20 @@ func (n *network) track(ip utils.IPDesc) {
 	if _, ok := n.myIPs[str]; ok {
 		return
 	}
+
+	if !n.peerSampler.ShouldConnect(ip, nil) {
+		return
+	}
+
 	n.disconnectedIPs[str] = struct{}{}
 
+	n.log.Debug("(track) Connecting to new node: %s", str)
 	go n.connectTo(ip)
 }
 
 // assumes the stateLock is not held. Only returns after the network is closed.
 func (n *network) gossip() {
-	t := time.NewTicker(n.peerListGossipSpacing)
+	t := time.NewTicker(n.peerSampler.PeerListGossipSpacing())
 	defer t.Stop()
 
 	for range t.C {
@@ -753,11 +760,17 @@ func (n *network) gossip() {
 			n.log.Debug("skipping validator gossiping as no public validators are connected")
 			continue
 		}
-		msg, err := n.b.PeerList(ips)
+		pushMsg, err := n.b.PeerList(ips)
 		if err != nil {
 			n.log.Error("failed to build peer list to gossip: %s. len(ips): %d",
 				err,
 				len(ips))
+			continue
+		}
+		pullMsg, err := n.b.GetPeerList()
+		if err != nil {
+			n.log.Error("failed to build peer list pull request: %s",
+				err)
 			continue
 		}
 
@@ -777,14 +790,16 @@ func (n *network) gossip() {
 			}
 		}
 
-		numStakersToSend := (n.peerListGossipSize + n.peerListStakerGossipFraction - 1) / n.peerListStakerGossipFraction
+		numStakersToSend := (n.peerSampler.PeerListGossipSize() + n.peerListStakerGossipFraction - 1) / n.peerListStakerGossipFraction
 		if len(stakers) < numStakersToSend {
 			numStakersToSend = len(stakers)
 		}
-		numNonStakersToSend := n.peerListGossipSize - numStakersToSend
+		numNonStakersToSend := n.peerSampler.PeerListGossipSize() - numStakersToSend
 		if len(nonStakers) < numNonStakersToSend {
 			numNonStakersToSend = len(nonStakers)
 		}
+
+		n.log.Debug("Gossiping peer list (%d peers) to %d stakers and %d non-stakers", len(ips), numStakersToSend, numNonStakersToSend)
 
 		s := sampler.NewUniform()
 		if err := s.Initialize(uint64(len(stakers))); err != nil {
@@ -803,7 +818,8 @@ func (n *network) gossip() {
 			continue
 		}
 		for _, index := range stakerIndices {
-			stakers[int(index)].send(msg)
+			stakers[int(index)].send(pullMsg)
+			stakers[int(index)].send(pushMsg)
 		}
 
 		if err := s.Initialize(uint64(len(nonStakers))); err != nil {
@@ -822,7 +838,8 @@ func (n *network) gossip() {
 			continue
 		}
 		for _, index := range nonStakerIndices {
-			nonStakers[int(index)].send(msg)
+			nonStakers[int(index)].send(pullMsg)
+			nonStakers[int(index)].send(pushMsg)
 		}
 		n.stateLock.Unlock()
 	}
@@ -893,9 +910,10 @@ func (n *network) attemptConnect(ip utils.IPDesc) error {
 		return err
 	}
 	return n.upgrade(&peer{
-		net:  n,
-		ip:   ip,
-		conn: conn,
+		net:        n,
+		ip:         ip,
+		conn:       conn,
+		isIncoming: false,
 	}, n.clientUpgrader)
 }
 
@@ -997,7 +1015,9 @@ func (n *network) connected(p *peer) {
 		n.connectedIPs[str] = struct{}{}
 	}
 
+	peer_sampling.Trace("C %s %s %t", p.ID(), p.IP(), p.IsIncoming())
 	n.router.Connected(p.id)
+	n.peerSampler.Connected(p)
 }
 
 // assumes the stateLock is held when called
@@ -1017,7 +1037,9 @@ func (n *network) disconnected(p *peer) {
 		n.track(p.ip)
 	}
 
+	peer_sampling.Trace("D %s %s %t", p.ID(), p.IP(), p.IsIncoming())
 	if p.connected {
 		n.router.Disconnected(p.id)
+		n.peerSampler.Disconnected(p)
 	}
 }

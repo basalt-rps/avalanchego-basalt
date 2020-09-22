@@ -1,3 +1,22 @@
+# Bᴀsᴀʟᴛ mod for AvalancheGo
+
+This repository is a fork from the [official AvalancheGo repository](https://github.com/ava-labs/gecko) by AVA Labs,
+that implements the novel Bᴀsᴀʟᴛ peer sampling algorithm.
+The code of the Bᴀsᴀʟᴛ algorithm provided in this repository is neither
+produced nor endorsed by the original AvalancheGo authors at AVA Labs.
+
+Bᴀsᴀʟᴛ is a new peer sampling algorithm which is built to provide resilience
+to Sybil attacks on the Internet. Bᴀsᴀʟᴛ is an alternative to Proof-of-Stake
+in this regard: it enables for the sampling of validator nodes not with probability
+weighted by their stake, but by giving similar weights to all nodes.
+To protect against Sybil attacks, a uniform probability distribution
+cannot be used. Instead, Bᴀsᴀʟᴛ spreads the sampled nodes over IP address
+prefixes in a hierarchical manner, preventing any single large entity
+from owning all our samples.
+
+Bᴀsᴀʟᴛ will be used as soon as the `--staking-tls-enabled=false`
+option is used.
+
 # AvalancheGo
 
 ## Installation

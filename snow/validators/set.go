@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/ava-labs/avalanchego/ids"
+	"github.com/ava-labs/avalanchego/network/peer_sampling"
 	"github.com/ava-labs/avalanchego/utils/formatting"
 	"github.com/ava-labs/avalanchego/utils/sampler"
 
@@ -335,7 +336,9 @@ func (s *set) sample(size int) ([]Validator, error) {
 
 	list := make([]Validator, size)
 	for i, index := range indices {
-		list[i] = s.vdrSlice[index]
+		sample := s.vdrSlice[index]
+		peer_sampling.Trace("S %s", sample.ID())
+		list[i] = sample
 	}
 	return list, nil
 }
